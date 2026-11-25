@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 
 from flask import Flask, jsonify, render_template, request
@@ -16,6 +17,38 @@ app = Flask(__name__)
 
 _LOCK = threading.RLock()
 _DRILL = Drill()
+
+# 连发由一条后台调度线程按批推进；所有状态访问仍用同一把 _LOCK。
+_BURST_WAKE = threading.Event()
+_SCHEDULER_STOP = threading.Event()
+
+
+def _scheduler_loop() -> None:
+    """按批执行连发：到点发一批、记录状态，再按批间隔等待。"""
+    while not _SCHEDULER_STOP.is_set():
+        with _LOCK:
+            try:
+                drill = _DRILL
+                drill.burst_tick()
+                wait = drill.burst_wait()
+            except Exception:  # 调度线程不能死，出错记日志并稍后重试
+                logging.exception("连发调度异常")
+                wait = 0.25
+        _BURST_WAKE.wait(wait)
+        _BURST_WAKE.clear()
+
+
+def _start_scheduler() -> None:
+    thread = threading.Thread(target=_scheduler_loop, name="burst-scheduler",
+                              daemon=True)
+    thread.start()
+
+
+_start_scheduler()
+
+
+def _wake_scheduler() -> None:
+    _BURST_WAKE.set()
 
 
 def _json_body() -> dict:
@@ -53,11 +86,12 @@ def get_state():
 
 @app.post("/api/reset")
 def reset_drill():
-    global _DRILL
     data = _json_body()
     with _LOCK:
         cfg = DrillConfig.from_raw(data if data else None)
-        _DRILL = Drill(cfg)
+        # 原地重置：旧连发的剩余包立即停发，并保留其结束快照供页面显示。
+        _DRILL.reset(cfg)
+        _wake_scheduler()
         return jsonify({"ok": True, "state": _DRILL.state_dict()})
 
 
@@ -65,17 +99,24 @@ def reset_drill():
 def send_next():
     with _LOCK:
         pkt = _DRILL.send_next()
+        _wake_scheduler()
         return jsonify({"ok": True, "packet": pkt.to_dict(),
                         "state": _DRILL.state_dict()})
 
 
 @app.post("/api/send-burst")
 def send_burst():
+    """受理一次分批连发：立即返回受理结果，后台按批发出。"""
     data = _json_body()
     count = data.get("count")
     with _LOCK:
-        pkts = _DRILL.send_burst(None if count in (None, "", 0, "all") else count)
-        return jsonify({"ok": True, "packets": [p.to_dict() for p in pkts],
+        burst = _DRILL.start_burst(
+            None if count in (None, "", "all") else count,
+            data.get("interval_ms", 0),
+        )
+        _wake_scheduler()
+        return jsonify({"ok": True, "accepted": True,
+                        "burst": burst.to_dict(),
                         "state": _DRILL.state_dict()})
 
 
@@ -92,6 +133,7 @@ def switch_line():
     line = _json_body().get("line", "")
     with _LOCK:
         result = _DRILL.switch_line(str(line).upper())
+        _wake_scheduler()
         return jsonify({"ok": True, "result": result,
                         "state": _DRILL.state_dict()})
 
@@ -100,6 +142,7 @@ def switch_line():
 def ack_packet(pid: int):
     with _LOCK:
         _pkt, added = _DRILL.acknowledge(pid)
+        _wake_scheduler()
         return jsonify({"ok": True, "added_bytes": added,
                         "state": _DRILL.state_dict()})
 
@@ -108,6 +151,7 @@ def ack_packet(pid: int):
 def timeout_packet(pid: int):
     with _LOCK:
         result = _DRILL.trigger_timeout(pid)
+        _wake_scheduler()
         return jsonify({"ok": True, "result": result,
                         "state": _DRILL.state_dict()})
 
@@ -116,8 +160,17 @@ def timeout_packet(pid: int):
 def deliver_notice(pid: int):
     with _LOCK:
         result = _DRILL.deliver_notice(pid)
+        _wake_scheduler()
         return jsonify({"ok": True, "result": result,
                         "state": _DRILL.state_dict()})
+
+
+@app.post("/api/burst/stop")
+def stop_burst():
+    with _LOCK:
+        _DRILL.stop_burst("user")
+        _wake_scheduler()
+        return jsonify({"ok": True, "state": _DRILL.state_dict()})
 
 
 if __name__ == "__main__":

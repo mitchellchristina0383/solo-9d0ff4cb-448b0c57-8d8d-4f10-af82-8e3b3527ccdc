@@ -12,7 +12,7 @@
     <h1>VPN 换线 · 大包卡住演练台</h1>
     <p class="subtitle">
       报文置 DF 禁止分片：<code>载荷 + 封装开销 &gt; 线路 MTU</code> 即丢弃。
-      可连续发包、乱序回执、触发超时、投递超长通知，或在回执前换线立即重发。
+      连发按批后台发送、可设批间隔，期间仍能单发、回执与换线。
     </p>
   </div>
   <div id="completeBanner" class="complete-banner hidden">✅ 全部字节已确认，传完！</div>
@@ -63,6 +63,7 @@
         <button class="btn primary" id="btnReset">应用参数并重置演练</button>
         <button class="btn ghost" data-preset="blackhole">预设：A 静默黑洞</button>
         <button class="btn ghost" data-preset="icmp">预设：A 有超长通知</button>
+        <button class="btn ghost" data-preset="slowburst">预设：长报表连发演练</button>
       </div>
       <p class="hint">修改参数后需点击“应用参数并重置演练”生效。</p>
     </div>
@@ -70,16 +71,25 @@
     <div class="card">
       <h2>② 发包 / 换线控制台</h2>
       <div id="statusChips" class="chips"></div>
+      <div id="burstStatus" class="burst-status"></div>
 
       <div class="row wrap">
         <button class="btn" id="btnSendOne">发下一包</button>
         <label class="inline">连发包数
           <input id="burstCount" type="number" min="1" max="5000" value="8" class="mini">
         </label>
+        <label class="inline">批间隔(ms)
+          <input id="burstInterval" type="number" min="0" max="60000" step="50"
+                 value="500" class="mini">
+        </label>
         <button class="btn" id="btnBurst">连续发包</button>
         <button class="btn" id="btnBurstAll">连续发完剩余新包</button>
+        <button class="btn danger" id="btnBurstStop" disabled>停止连发</button>
         <button class="btn warn" id="btnResendMissing">重发全部未确认</button>
       </div>
+      <p class="hint">连发提交后只返回“已受理”，后台分批发送，每批最多
+        <span id="burstBatchSize">5</span> 包；批间隔为下一批前的等待时间。
+        连发期间单发仍可用（不占用连发包数），同一时间只能有一次连发。</p>
 
       <div class="row wrap switch-row">
         <span class="switch-label">回执到达前换线：</span>
@@ -153,6 +163,7 @@
       <li>每包带轮次号。投递超长通知或触发超时时，只有属于当前轮次的包能缩包；处理一次后轮次 +1，旧包的信号只记录、不缩包。</li>
       <li>已确认字节用合并区间并集维护，重叠回执新增 0 字节，不重复计数。</li>
       <li>重发 / 换线重发打包时跳过已确认区间，只携带尚未确认的连续字节，因此可能比设定载荷短或被已确认区间截断。</li>
+      <li>连发提交后先返回“已受理”，后台按批发送；同一场演练同时只允许一次连发。连发期间的单发与连发都只取下一段未首发字节，单发不占连发包数；到报表末尾按实发数收尾。换线、有效缩包或重置生效后，旧连发剩余包立即停发。</li>
     </ul>
   </details>
 </footer>

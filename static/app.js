@@ -103,6 +103,11 @@ function applyPreset(name) {
     set("cfg-total", 10000); set("cfg-start", 1400); set("cfg-step", 200);
     set("cfg-A-mtu", 1500); set("cfg-A-overhead", 120); $("cfg-A-notify").checked = false;
     set("cfg-B-mtu", 1500); set("cfg-B-overhead", 60);  $("cfg-B-notify").checked = true;
+  } else if (name === "slowburst") {
+    set("cfg-total", 60000); set("cfg-start", 1400); set("cfg-step", 200);
+    set("cfg-A-mtu", 1500); set("cfg-A-overhead", 60);  $("cfg-A-notify").checked = true;
+    set("cfg-B-mtu", 1500); set("cfg-B-overhead", 60);  $("cfg-B-notify").checked = true;
+    set("burstCount", 50); set("burstInterval", 800);
   } else {
     set("cfg-A-mtu", 1500); set("cfg-A-overhead", 120); $("cfg-A-notify").checked = true;
     set("cfg-B-mtu", 1500); set("cfg-B-overhead", 60);  $("cfg-B-notify").checked = true;
@@ -113,7 +118,12 @@ function applyPreset(name) {
 /* ---------------- 渲染 ---------------- */
 
 const KIND_TEXT = {
-  new: "新发", missing: "重发缺口", timeout: "超时重发", switch: "换线重发",
+  new: "新发", burst: "连发", missing: "重发缺口", timeout: "超时重发",
+  switch: "换线重发",
+};
+
+const BURST_STATE_TEXT = {
+  pending: "已受理·待发首批", running: "进行中", finished: "已结束",
 };
 
 function pct(part, all) { return all > 0 ? (part / all * 100) : 0; }
@@ -121,14 +131,44 @@ function pct(part, all) { return all > 0 ? (part / all * 100) : 0; }
 function render(s) {
   STATE = s;
   renderChips(s);
+  renderBurst(s);
   renderProgress(s);
   renderPackets(s);
   renderTimeline(s);
   $("completeBanner").classList.toggle("hidden", !s.complete);
   for (const id of ["btnSendOne", "btnBurst", "btnBurstAll", "btnResendMissing",
-                    "btnSwitchA", "btnSwitchB"]) {
+                    "btnSwitchA", "btnSwitchB", "btnBurstStop"]) {
     $(id).disabled = s.complete;
   }
+  /* 连发进行中不允许再提交连发；单发/回执/换线保持可用 */
+  if (s.burst_active) {
+    $("btnBurst").disabled = true;
+    $("btnBurstAll").disabled = true;
+  }
+  if (s.complete || !s.burst_active) $("btnBurstStop").disabled = true;
+  if (s.burst_batch_size) $("burstBatchSize").textContent = s.burst_batch_size;
+}
+
+function renderBurst(s) {
+  const el = $("burstStatus");
+  const live = s.burst;
+  const last = s.last_burst;
+  const parts = [];
+  if (live) {
+    const cls = live.state === "pending" ? "b-pending" : "b-running";
+    parts.push(`<span class="burst-chip ${cls}">连发 #${live.id} ·
+      ${BURST_STATE_TEXT[live.state] || live.state} ·
+      实发 <b>${live.sent}</b> / 请求 ${live.requested} 包 ·
+      批间隔 ${live.interval_ms} ms</span>`);
+  }
+  if (last) {
+    parts.push(`<span class="burst-chip b-last">最近一次连发 #${last.id}：
+      实发 <b>${last.sent}</b> 包 · 结束原因：<b>${escapeHtml(last.end_text)}</b></span>`);
+  }
+  if (!parts.length) {
+    parts.push(`<span class="hint">尚无连发记录。</span>`);
+  }
+  el.innerHTML = parts.join("");
 }
 
 function renderChips(s) {
@@ -299,6 +339,21 @@ async function batchAck(mode) {
   }
 }
 
+async function submitBurst(body) {
+  const raw = $("burstInterval").value;
+  const interval = Number(raw === "" ? 0 : raw);
+  if (!Number.isInteger(interval) || interval < 0 || interval > 60000) {
+    showToast("批间隔需为 0~60000 的整数毫秒", true);
+    return;
+  }
+  const r = await act("/api/send-burst", { ...body, interval_ms: interval });
+  if (r && r.accepted) {
+    const b = r.burst;
+    showToast(`连发 #${b.id} 已受理：请求 ${b.requested} 包，` +
+              `每批至多 ${r.state.burst_batch_size} 包，批间隔 ${b.interval_ms} ms`);
+  }
+}
+
 function setBatchDisabled(d) {
   $("btnAckAll").disabled = d;
   $("btnAckRandom").disabled = d;
@@ -326,10 +381,11 @@ function bind() {
   $("btnBurst").addEventListener("click", () => {
     const n = Number($("burstCount").value);
     if (!Number.isInteger(n) || n < 1) { showToast("连发包数需为正整数", true); return; }
-    act("/api/send-burst", { count: n }, `已连续发出 ${n} 包（或发到报表末尾）`);
+    submitBurst({ count: n });
   });
-  $("btnBurstAll").addEventListener("click", () =>
-    act("/api/send-burst", { count: "all" }, "已连续发完所有剩余新包"));
+  $("btnBurstAll").addEventListener("click", () => submitBurst({ count: "all" }));
+  $("btnBurstStop").addEventListener("click", () =>
+    act("/api/burst/stop", {}, "已停止连发"));
   $("btnResendMissing").addEventListener("click", () => act("/api/resend-missing"));
 
   $("btnSwitchA").addEventListener("click", () =>
@@ -355,4 +411,8 @@ function bind() {
 bind();
 refreshEffLabels();
 loadState();
+/* 连发进行中加快轮询，便于看到逐批推进；空闲时 2.5s 一次。 */
+setInterval(() => {
+  if (STATE && STATE.burst_active) loadState();
+}, 500);
 setInterval(loadState, 2500);

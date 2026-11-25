@@ -11,10 +11,21 @@
 * 任何线路（包括旧线）报文的成功回执都有效；
 * 已确认字节用合并区间的并集维护，重叠范围只计一次；
 * 重发打包时跳过所有已确认区间，只取尚未确认的连续字节。
+
+连发（burst）规则：
+* 连发是后台分批执行的：``start_burst`` 只登记任务并返回受理信息，
+  由外部调度线程反复调用 ``burst_tick`` / ``burst_step`` 推进；
+* 同一场演练同时只允许一次连发；
+* 连发期间的单发与连发都只从 ``next_offset``（下一段未首发字节）取载荷，
+  且单发不占用连发请求的包数；
+* 连发按请求包数收尾；先到报表末尾时按实发包数收尾；
+* 换线、当前轮有效缩包（超时/超长通知）、重置或全部确认后，
+  本次连发的剩余包立即停发，并记录结束原因。
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Optional
@@ -24,6 +35,8 @@ MAX_TOTAL_BYTES = 1_000_000
 MAX_PAYLOAD = 65_535
 MAX_STEP = 65_535
 MAX_PACKETS = 5_000
+MAX_BURST_INTERVAL_MS = 60_000
+BURST_BATCH_SIZE = 5  # 每批最多发出的包数
 EVENT_KEEP = 400
 
 
@@ -205,7 +218,7 @@ class Packet:
     end: int
     wire_size: int
     round: int
-    kind: str  # new | missing | timeout | switch
+    kind: str  # new | burst | missing | timeout | switch
     # 发送端看到的协议状态
     status: str = "outstanding"  # outstanding | acked | timeout
     # 上帝视角的物理结果
@@ -213,19 +226,81 @@ class Packet:
     notice_state: Optional[str] = None  # None | pending | applied | ignored
     late_ack: bool = False
     created_order: int = 0
+    burst_id: Optional[int] = None  # 由哪次连发发出（单发为 None）
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-class Drill:
-    """一次演练的全部可变状态。Web 层用锁保护对同一实例的调用。"""
+# 连发结束原因
+BURST_END_TEXT = {
+    "done": "请求包数已发完",
+    "eof": "已到报表末尾，按实发数收尾",
+    "complete": "报表已全部确认",
+    "switch": "换线生效，剩余包停发",
+    "shrink": "有效缩包生效，剩余包停发",
+    "reset": "演练被重置",
+    "user": "用户手动停止",
+    "error": "连发执行出错",
+    "none": "—",
+}
 
-    def __init__(self, config: Optional[DrillConfig] = None):
+
+@dataclass
+class Burst:
+    """一次分批连发任务。``sent`` 只统计本任务真实发出的包。"""
+
+    id: int
+    requested: int  # 请求包数（None 表示“发完剩余新包”，内部换算成上限）
+    all_remaining: bool
+    interval_ms: int
+    state: str = "pending"  # pending | running | finished
+    sent: int = 0
+    end_reason: Optional[str] = None
+    started_at: float = 0.0
+    finished_at: Optional[float] = None
+    scheduled_at: float = 0.0  # 下一批最早执行时间
+    last_batch: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "requested": self.requested,
+            "all_remaining": self.all_remaining,
+            "interval_ms": self.interval_ms,
+            "state": self.state,
+            "sent": self.sent,
+            "end_reason": self.end_reason,
+            "end_text": BURST_END_TEXT.get(self.end_reason, "—"),
+            "running": self.state in ("pending", "running"),
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "last_batch": self.last_batch,
+        }
+
+
+class Drill:
+    """一次演练的全部可变状态。
+
+    ``burst_tick`` 内部持 ``lock``；Web 层再用一把全局锁把所有请求与
+    调度线程串行化，因此调度线程与单发/回执可以安全交错。
+    """
+
+    def __init__(self, config: Optional[DrillConfig] = None, clock=None):
+        self.lock = threading.RLock()
+        self._now = clock or time.monotonic  # 可注入时钟，便于确定性地测试分批连发
+        self.next_burst_id = 1
+        self.burst: Optional[Burst] = None
+        self.last_burst: Optional[dict] = None
         self.reset(config or DrillConfig.from_raw(None))
 
     # ---- 初始化 / 事件 -------------------------------------------------
     def reset(self, config: DrillConfig) -> None:
+        # 重置生效：旧连发的剩余包立即停发；快照保留供页面显示结束原因。
+        carried_last = None
+        if self._burst_active():
+            self._finish_burst("reset")
+            carried_last = self.last_burst
         self.cfg = config
         self.active_line = "A"
         self.cur_payload = config.start_payload
@@ -238,8 +313,17 @@ class Drill:
         self.completed_at: Optional[str] = None
         self.events: list[dict] = []
         self._event_seq = 0
+        self.next_burst_id = getattr(self, "next_burst_id", 1)  # 重置后编号继续递增
+        self.burst: Optional[Burst] = None      # 正在进行的连发（同一时刻最多一个）
+        self.last_burst: Optional[dict] = carried_last  # 最近一次已结束连发
         self._log("reset", f"演练开始：报表 {config.total_bytes} 字节，"
                            f"起始载荷 {config.start_payload}，初始走线路 A（第 1 轮）")
+        if carried_last:
+            self._log(
+                "burst-end",
+                f"连发 #{carried_last['id']} 因重置停发：实发 {carried_last['sent']} / "
+                f"请求 {carried_last['requested']} 包",
+            )
 
     def _log(self, kind: str, text: str) -> dict:
         self._event_seq += 1
@@ -269,10 +353,13 @@ class Drill:
             self.completed_at = time.strftime("%H:%M:%S")
             self._log("complete",
                       f"累计确认 {self.acked.count}/{self.cfg.total_bytes} 字节，全部传完 ✅")
+            if self._burst_active():
+                self._finish_burst("complete")
 
     # ---- 发送 ----------------------------------------------------------
     def _dispatch(self, start: int, end: int, kind: str,
-                  line: Optional[str] = None) -> Packet:
+                  line: Optional[str] = None,
+                  burst_id: Optional[int] = None) -> Packet:
         line_key = line or self.active_line
         lc = self._line(line_key)
         size = end - start
@@ -287,6 +374,7 @@ class Drill:
             round=self.round,
             kind=kind,
             created_order=self.next_pkt_id,
+            burst_id=burst_id,
         )
         self.next_pkt_id += 1
 
@@ -319,21 +407,31 @@ class Drill:
     def _kind_text(kind: str) -> str:
         return {
             "new": "新发顺序段",
+            "burst": "连发顺序段",
             "missing": "重发未确认",
             "timeout": "超时缩包后重发",
             "switch": "换线后立即重发",
         }.get(kind, kind)
 
     def send_next(self) -> Packet:
-        """发下一包：优先推进尚未首次发送的新字节；新字节发完后补最早的缺口。"""
+        """发下一包：优先推进尚未首次发送的新字节；新字节发完后补最早的缺口。
+
+        连发进行中也可单发，但同样只从下一段未首发字节取载荷（不去补缺口）；
+        单发不占用连发请求的包数，连发会相应少发。
+        """
         if self.complete:
             raise DrillError("报表已全部确认，无需再发", 409)
         total = self.cfg.total_bytes
+        burst_active = self._burst_active()
         if self.next_offset < total:
             start = self.next_offset
             end = min(total, start + self.cur_payload)
             self.next_offset = end
             kind = "new"
+        elif burst_active:
+            # 连发期间只发未首发字节；没有了就按实发数收尾
+            self._finish_burst("eof")
+            raise DrillError("新字节已全部首发，连发已按实发数收尾", 409)
         else:
             runs = self.acked.packetize_unacked(self.cur_payload)
             if not runs:
@@ -341,34 +439,144 @@ class Drill:
                 raise DrillError("已经没有未确认字节", 409)
             start, end = runs[0]
             kind = "missing"
-        return self._dispatch(start, end, kind)
+        pkt = self._dispatch(start, end, kind)
+        if burst_active and self.next_offset >= total:
+            # 单发把新字节推到末尾：连发没有新字节可发，按实发数提前结束
+            self._finish_burst("eof")
+        return pkt
 
-    def send_burst(self, count: Optional[int]) -> list[Packet]:
-        """连续发送 count 个顺序新包；count 为空时把剩余新字节全部发完。"""
+    # ---- 连发任务 ------------------------------------------------------
+    def _burst_active(self) -> bool:
+        return self.burst is not None and self.burst.state in ("pending", "running")
+
+    def start_burst(self, count: Optional[int], interval_ms) -> Burst:
+        """受理一次连发：只登记任务，立即返回；后台按批推进。
+
+        ``count is None`` 表示“连续发完剩余新包”。会被换算成一个足够的
+        请求上限，收尾时仍按实际发出的包数记录。
+        """
         if self.complete:
             raise DrillError("报表已全部确认，无需再发", 409)
-        if count is None:
-            remaining_bytes = self.cfg.total_bytes - self.next_offset
-            need = (remaining_bytes + self.cur_payload - 1) // self.cur_payload
-            if need > MAX_PACKETS:
-                raise DrillError(
-                    f"按当前载荷 {self.cur_payload} 连发全部需要约 {need} 个包，"
-                    f"超过上限 {MAX_PACKETS}，请调大起始载荷",
-                )
-            count = max(1, need)
-        count = _as_int({"c": count}, "c", 1, 1, MAX_PACKETS)
-        created: list[Packet] = []
-        for _ in range(count):
-            if self.next_offset >= self.cfg.total_bytes:
-                break
-            start = self.next_offset
-            end = min(self.cfg.total_bytes, start + self.cur_payload)
-            self.next_offset = end
-            created.append(self._dispatch(start, end, "new"))
-        if not created:
+        if self._burst_active():
+            raise DrillError(
+                f"已有一次连发正在执行（#{self.burst.id}，已发 {self.burst.sent} 包），"
+                "同一场演练同时只能有一次连发",
+                409,
+            )
+        try:
+            interval = int(interval_ms if interval_ms not in (None, "") else 0)
+        except (TypeError, ValueError):
+            raise DrillError(f"批间隔必须是整数毫秒，收到：{interval_ms!r}")
+        if not 0 <= interval <= MAX_BURST_INTERVAL_MS:
+            raise DrillError(f"批间隔必须在 0~{MAX_BURST_INTERVAL_MS} 毫秒之间，"
+                             f"当前为 {interval}")
+
+        total = self.cfg.total_bytes
+        all_remaining = count is None
+        if all_remaining:
+            remaining = total - self.next_offset
+            requested = max(1, (remaining + self.cur_payload - 1) // self.cur_payload)
+        else:
+            requested = _as_int({"count": count}, "count", 1, 1, MAX_PACKETS)
+        if requested > MAX_PACKETS:
+            raise DrillError(
+                f"连发需要约 {requested} 个包，超过上限 {MAX_PACKETS}，请调大载荷或报表后重试",
+            )
+        if self.next_offset >= total:
             raise DrillError("新字节已全部分段发送过，请用“重发未确认字节”补缺口", 409)
-        self._log("burst", f"本次连续发包 {len(created)} 个（均为第 {self.round} 轮）")
-        return created
+
+        now = self._now()
+        burst = Burst(
+            id=self.next_burst_id,
+            requested=requested,
+            all_remaining=all_remaining,
+            interval_ms=interval,
+            started_at=now,
+            scheduled_at=now,
+        )
+        self.next_burst_id += 1
+        self.burst = burst
+        self._log(
+            "burst-start",
+            f"连发 #{burst.id} 已受理：请求 {requested} 包"
+            f"{'（发完剩余新包）' if all_remaining else ''}，"
+            f"批间隔 {interval} ms，分批后台执行",
+        )
+        return burst
+
+    def burst_wait(self, max_wait: float = 0.25) -> float:
+        """调度线程的等待时长：离下一批还有多久（无连发时 0.25s 兜底）。"""
+        if not self._burst_active():
+            return max_wait
+        remaining = self.burst.scheduled_at - self._now()
+        if remaining <= 0:
+            return 0.0
+        return min(max_wait, remaining)
+
+    def burst_tick(self) -> list[Packet]:
+        """若已到点，执行一批；返回本批发出的包（未到点/无任务返回空）。
+
+        由调度线程周期调用；内部持可重入锁，可与 Web 请求的写操作安全交错。
+        """
+        if not self._burst_active():
+            return []
+        with self.lock:
+            if not self._burst_active():
+                return []
+            burst = self.burst
+            now = self._now()
+            if now < burst.scheduled_at:
+                return []
+
+            burst.state = "running"
+            total = self.cfg.total_bytes
+            quota = burst.requested - burst.sent
+            batch = min(BURST_BATCH_SIZE, quota)
+            created: list[Packet] = []
+            for _ in range(batch):
+                if self.complete:
+                    self._finish_burst("complete")
+                    break
+                if self.next_offset >= total:
+                    # 新字节已发到末尾，剩余请求没有可发的“未首发”载荷
+                    self._finish_burst("eof")
+                    break
+                start = self.next_offset
+                end = min(total, start + self.cur_payload)
+                self.next_offset = end
+                created.append(self._dispatch(start, end, "burst", burst_id=burst.id))
+                burst.sent += 1
+            if created:
+                burst.last_batch = len(created)
+                # 下一批最早执行时间：严格按批间隔，避免忙等
+                burst.scheduled_at = self._now() + burst.interval_ms / 1000.0
+            if self._burst_active() and burst.sent >= burst.requested:
+                self._finish_burst("done")
+            elif self._burst_active() and self.next_offset >= total:
+                self._finish_burst("eof")
+            return created
+
+    def _finish_burst(self, reason: str) -> None:
+        burst = self.burst
+        if burst is None or burst.state not in ("pending", "running"):
+            return
+        burst.state = "finished"
+        burst.end_reason = reason
+        burst.finished_at = self._now()
+        snapshot = burst.to_dict()
+        self.last_burst = snapshot
+        self.burst = None
+        text = BURST_END_TEXT.get(reason, reason)
+        self._log(
+            "burst-end",
+            f"连发 #{snapshot['id']} 结束：实发 {snapshot['sent']} / 请求 "
+            f"{snapshot['requested']} 包，原因：{text}",
+        )
+
+    def stop_burst(self, reason: str) -> None:
+        """外部事件（换线/缩包/重置）触发时停掉进行中的连发。"""
+        if self._burst_active():
+            self._finish_burst(reason)
 
     def resend_missing(self, kind: str = "missing") -> list[Packet]:
         """按当前载荷把所有未确认字节重新打包发出；只含尚未确认的字节。"""
@@ -437,6 +645,7 @@ class Drill:
         old = self.cur_payload
         self.cur_payload = max(1, old - self.cfg.timeout_step)
         self.round += 1
+        self.stop_burst("shrink")  # 有效缩包：旧连发剩余包立即停发
         self._log(
             "timeout-shrink",
             f"#{pid} 超时（当前轮）：载荷 {old} -> {self.cur_payload}"
@@ -475,6 +684,8 @@ class Drill:
         self.cur_payload = min(old, target)
         pkt.notice_state = "applied"
         self.round += 1
+        # 通知生效会推进轮次；旧连发的剩余包若继续发就会带错轮次，立即停发。
+        self.stop_burst("shrink")
         warn = ""
         if lc.max_payload < 1:
             warn = "；注意 MTU-封装开销 <= 0，配置有误，任何载荷都无法通过"
@@ -496,6 +707,7 @@ class Drill:
         self.active_line = line_key
         self.cur_payload = self.cfg.start_payload  # 每次换线都从起始载荷重新试发
         self.round += 1
+        self.stop_burst("switch")  # 换线生效：旧连发剩余包立即停发
         self._log(
             "switch",
             f"{old_line} -> {line_key} 换线：当前载荷重置为起始载荷 "
@@ -511,6 +723,7 @@ class Drill:
 
     # ---- 序列化 -------------------------------------------------------
     def state_dict(self) -> dict:
+        burst = self.burst.to_dict() if self.burst else None
         return {
             "config": self.cfg.to_dict(),
             "active_line": self.active_line,
@@ -523,8 +736,13 @@ class Drill:
             "completed_at": self.completed_at,
             "packets": [p.to_dict() for p in self.packets],
             "events": self.events[-150:],
+            "burst": burst,
+            "burst_active": burst is not None and burst["running"],
+            "last_burst": self.last_burst,
+            "burst_batch_size": BURST_BATCH_SIZE,
             "limits": {
                 "max_total_bytes": MAX_TOTAL_BYTES,
                 "max_packets": MAX_PACKETS,
+                "max_burst_interval_ms": MAX_BURST_INTERVAL_MS,
             },
         }
